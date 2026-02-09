@@ -76,6 +76,9 @@ class LithoOpticsRect:
     # Interpolation Method
     interpolation_method: str = 'rbf'   # 'rbf', 'linear', 'nearest'
     
+    # Reproducibility
+    random_seed: int = 42               # Random seed for deterministic sampling
+    
     def __post_init__(self):
         assert self.N_x % 2 == 0 and self.N_y % 2 == 0, "Grid dimensions must be even"
         print(f"[CONFIG] Rectangular Grid: {self.N_y}×{self.N_x} | λ={self.lambda_nm}nm NA={self.NA:.3f} dx={self.dx_nm}nm")
@@ -117,48 +120,67 @@ def get_optical_support(opt: LithoOpticsRect, fx: np.ndarray, fy: np.ndarray) ->
     return valid_indices, support_mask
 
 # ==============================================================================
-# Module 4: Adaptive Sparse Frequency Sampling (Core Optimization)
+# Module 4: Adaptive Sparse Frequency Sampling (CRITICAL BUG FIX)
 # ==============================================================================
 def adaptive_sparse_freq_sampling(opt: LithoOpticsRect, fx: np.ndarray, fy: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Adaptive sparse sampling: non-uniform points within optical support
-    Returns: fx_sparse, fy_sparse, sampling_weights
+    
+    BUG FIX: Correctly handles fftfreq ordering and ensures no shape mismatches.
+    Returns flattened 1D arrays for consistent matrix operations.
     """
     fc = opt.NA / opt.lambda_nm
     f_bound = fc * (1 + opt.sigma_c)
     
-    # Calculate effective region in pixels
-    dy_eff = int(opt.N_y * f_bound / (1/(2*opt.dy_nm)))
-    dx_eff = int(opt.N_x * f_bound / (1/(2*opt.dx_nm)))
+    # Get 1D frequency arrays (unique values)
+    fx_1d = np.fft.fftfreq(opt.N_x, d=opt.dx_nm)
+    fy_1d = np.fft.fftfreq(opt.N_y, d=opt.dy_nm)
     
-    # Sparse strategy: dense in center, sparse at edges
-    y_idx_center = np.linspace(0, dy_eff//4, int(dy_eff//4 * opt.sparse_sampling_rate), dtype=int)
-    y_idx_edge = np.linspace(dy_eff//4, dy_eff//2, int(dy_eff//8 * opt.sparse_sampling_rate * 0.5), dtype=int)
-    y_idx = np.unique(np.concatenate([y_idx_center, y_idx_edge]))
+    # Find VALID indices where |frequency| <= bound
+    # This is the correct way to identify optical support indices
+    fx_valid_mask = np.abs(fx_1d) <= f_bound
+    fy_valid_mask = np.abs(fy_1d) <= f_bound
     
-    x_idx_center = np.linspace(0, dx_eff//4, int(dx_eff//4 * opt.sparse_sampling_rate), dtype=int)
-    x_idx_edge = np.linspace(dx_eff//4, dx_eff//2, int(dx_eff//8 * opt.sparse_sampling_rate * 0.5), dtype=int)
-    x_idx = np.unique(np.concatenate([x_idx_center, x_idx_edge]))
+    fx_valid_indices = np.where(fx_valid_mask)[0]
+    fy_valid_indices = np.where(fy_valid_mask)[0]
     
-    # Use Hermitian symmetry: sample 1/4 region
-    fy_base = np.fft.fftfreq(opt.N_y, d=opt.dy_nm)
-    fx_base = np.fft.fftfreq(opt.N_x, d=opt.dx_nm)
+    # Adaptive sampling: denser near center (zero frequency)
+    # Use non-linear sampling (cubic root) to concentrate points near center
+    n_fx_sample = max(int(len(fx_valid_indices) * opt.sparse_sampling_rate), 10)
+    n_fy_sample = max(int(len(fy_valid_indices) * opt.sparse_sampling_rate), 10)
     
-    fy_sparse = fy_base[y_idx]
-    fx_sparse = fx_base[x_idx]
+    # Sample with higher density near zero frequency
+    # Use cumulative distribution of a Gaussian-like function
+    fx_center_idx = len(fx_valid_indices) // 2
+    fy_center_idx = len(fy_valid_indices) // 2
     
-    # Create 2D sparse grid
-    fx_sparse, fy_sparse = np.meshgrid(fx_sparse, fy_sparse)
+    # Generate sample indices using non-linear spacing
+    indices = np.linspace(0, 1, n_fx_sample)**0.3  # Concentrate near start
+    fx_sample_indices = (indices * (len(fx_valid_indices)-1)).astype(int)
+    fx_sample_indices = np.unique(fx_sample_indices)
+    
+    indices = np.linspace(0, 1, n_fy_sample)**0.3
+    fy_sample_indices = (indices * (len(fy_valid_indices)-1)).astype(int)
+    fy_sample_indices = np.unique(fy_sample_indices)
+    
+    # Map back to original array indices
+    fx_indices_to_use = fx_valid_indices[fx_sample_indices]
+    fy_indices_to_use = fy_valid_indices[fy_sample_indices]
+    
+    # Create sparse grids (2D for interpolation compatibility)
+    fx_sparse, fy_sparse = np.meshgrid(fx_1d[fx_indices_to_use], fy_1d[fy_indices_to_use])
     
     # Calculate sampling weights to compensate for undersampling
-    dy_ratio = len(y_idx) / (opt.N_y/2)
-    dx_ratio = len(x_idx) / (opt.N_x/2)
-    sampling_weights = np.ones_like(fx_sparse) / (dy_ratio * dx_ratio)
+    sample_ratio_x = len(fx_indices_to_use) / opt.N_x
+    sample_ratio_y = len(fy_indices_to_use) / opt.N_y
+    weights_factor = 1.0 / (sample_ratio_x * sample_ratio_y)
+    sampling_weights = np.full_like(fx_sparse, weights_factor).ravel()
     
-    print(f"[COMPRESS-2] Sparse Sampling: {opt.N_y}×{opt.N_x} → {len(y_idx)}×{len(x_idx)} = {len(y_idx)*len(x_idx)} points")
-    print(f"             Sampling Rate: {opt.sparse_sampling_rate*100:.0f}% | Compression: {opt.N_y*opt.N_x/(len(y_idx)*len(x_idx)):.1f}x")
+    print(f"[COMPRESS-2] Sparse Sampling: {opt.N_y}×{opt.N_x} → {len(fy_indices_to_use)}×{len(fx_indices_to_use)} = {len(fx_indices_to_use)*len(fy_indices_to_use)} points")
+    print(f"             Sampling Rate: {opt.sparse_sampling_rate*100:.0f}% | Compression: {opt.N_y*opt.N_x/(len(fx_indices_to_use)*len(fy_indices_to_use)):.1f}x")
     
-    return fx_sparse, fy_sparse, sampling_weights.ravel()
+    # Return flattened arrays to prevent shape mismatches in matrix operations
+    return fx_sparse.ravel(), fy_sparse.ravel(), sampling_weights
 
 # ==============================================================================
 # Module 5: Pupil and Source Functions
@@ -188,10 +210,13 @@ def sample_conventional_source(opt: LithoOpticsRect) -> Tuple[np.ndarray, np.nda
     fc = opt.NA / opt.lambda_nm
     max_radius = opt.sigma_c * fc
     
-    # Uniform sampling in circle using polar transformation
-    u = np.random.rand(opt.N_source)
+    # Set random seed for reproducibility
+    rng = np.random.RandomState(opt.random_seed)
+    
+    # Uniform sampling in circle using area-preserving transformation
+    u = rng.rand(opt.N_source)
     r = np.sqrt(u) * max_radius
-    theta = np.random.rand(opt.N_source) * 2 * PI
+    theta = rng.rand(opt.N_source) * 2 * PI
     
     fx_s = r * np.cos(theta)
     fy_s = r * np.sin(theta)
@@ -212,14 +237,9 @@ def build_sparse_mode_matrix_M(
     """
     Construct sparse M matrix: M_sparse ∈ C^(N_sparse × N_source)
     
-    BUG FIX: Flatten 2D meshgrids to 1D arrays to match sampling_weights dimension.
-    Original code failed due to shape mismatch between 2D frequency arrays and 1D weights.
+    CRITICAL FIX: All inputs are now 1D flattened arrays, preventing shape mismatches.
     """
-    # CRITICAL FIX: Flatten 2D meshgrids to 1D for consistent matrix operations
-    fx_sparse_flat = fx_sparse.ravel()
-    fy_sparse_flat = fy_sparse.ravel()
-    
-    N_sparse = len(fx_sparse_flat)  # Total number of sparse frequency points
+    N_sparse = len(fx_sparse)  # Total number of sparse frequency points
     Ns = opt.N_source
     
     # Sample source points
@@ -237,11 +257,12 @@ def build_sparse_mode_matrix_M(
     for i in range(Ns):
         fx_s, fy_s = fs_coords[i]
         # Combine source weight with sampling weights (element-wise)
+        # sampling_weights is 1D, weights[i] is scalar
         w = sqrt_sampling_weights * np.sqrt(weights[i] + EPS)
         
         # Calculate shifted pupils on flattened sparse grid
-        P1 = shifted_pupil_rect(fx_sparse_flat, fy_sparse_flat, np.array([-fx_s/2, -fy_s/2]), opt)
-        P2 = shifted_pupil_rect(fx_sparse_flat, fy_sparse_flat, np.array([+fx_s/2, +fy_s/2]), opt)
+        P1 = shifted_pupil_rect(fx_sparse, fy_sparse, np.array([-fx_s/2, -fy_s/2]), opt)
+        P2 = shifted_pupil_rect(fx_sparse, fy_sparse, np.array([+fx_s/2, +fy_s/2]), opt)
         
         # Calculate sparse mode vector (all 1D arrays, element-wise multiplication)
         mode_sparse = P1 * P2.conj() * w
@@ -254,9 +275,6 @@ def build_sparse_mode_matrix_M(
     
     elapsed = time.time() - start
     print(f"[BUILD] M matrix shape: {M_sparse.shape}, Memory: {M_sparse.nbytes/1e6:.1f} MB | Time: {elapsed:.2f}s")
-    
-    # Clear temporary arrays to free memory
-    del fx_sparse_flat, fy_sparse_flat
     
     return M_sparse, fs_coords, weights
 
@@ -290,7 +308,7 @@ def sparse_socs_decompose(M_sparse: np.ndarray, n_socs: int, energy_threshold: f
     return alpha, V_sparse
 
 # ==============================================================================
-# Module 8: Kernel Reconstruction from Sparse Basis
+# Module 8: Kernel Reconstruction from Sparse Basis (CRITICAL BUG FIX)
 # ==============================================================================
 def reconstruct_kernels_from_sparse(
     opt: LithoOpticsRect,
@@ -301,6 +319,9 @@ def reconstruct_kernels_from_sparse(
 ) -> List[np.ndarray]:
     """
     Reconstruct full-size spatial kernels from sparse basis using interpolation
+    
+    BUG FIX: Added fill_value=0.0 to griddata to prevent NaN propagation.
+    Added explicit NaN check and handling for robustness.
     """
     Ny, Nx = opt.N_y, opt.N_x
     n_socs = V_sparse.shape[1]
@@ -308,65 +329,55 @@ def reconstruct_kernels_from_sparse(
     # Full frequency grid
     fx_full, fy_full = freq_grid_rect(opt)
     
-    # Sparse points for interpolation
-    points_sparse = np.stack([fx_sparse.ravel(), fy_sparse.ravel()], axis=1)
-    
     kernels = []
     print(f"\n[RECON] Interpolating {n_socs} kernels...")
     print(f"         Method: {opt.interpolation_method}")
     start = time.time()
     
-    # Choose interpolation method
-    if opt.interpolation_method == 'rbf':
-        # Prepare RBF interpolator (more accurate but slower)
-        epsilon = 0.1
+    # Prepare sparse points for interpolation (2D coordinates)
+    points_sparse = np.column_stack([fx_sparse, fy_sparse])
+    
+    for k in range(n_socs):
+        Vk_values = V_sparse[:, k]
         
-        for k in range(n_socs):
-            Vk_values = V_sparse[:, k]
-            
-            # Create RBF interpolator
+        # Interpolate to full grid
+        if opt.interpolation_method == 'rbf':
+            # Radial Basis Function (accurate but slower)
+            # Use smaller epsilon for smoother interpolation
             rbf_interp = Rbf(
-                fx_sparse.ravel(), 
-                fy_sparse.ravel(), 
+                fx_sparse, 
+                fy_sparse, 
                 Vk_values,
                 function='multiquadric',
-                epsilon=epsilon
+                epsilon=0.15
             )
             Vk_full = rbf_interp(fx_full, fy_full)
-            
-            # Transform to spatial domain
-            spat_full = ifft2c_rect(Vk_full) * np.sqrt(Ny*Nx)
-            
-            # Center crop
-            spat_crop = crop_kernel_center_rect(spat_full, opt.kernel_crop_h, opt.kernel_crop_w)
-            
-            kernels.append(spat_crop)
-            
-            if (k+1) % 10 == 0:
-                print(f"  Reconstructed {k+1}/{n_socs} kernels")
-    else:
-        # Use griddata interpolation (faster)
-        for k in range(n_socs):
-            Vk_values = V_sparse[:, k]
-            
-            # Interpolate to full grid
+        else:
+            # griddata interpolation (faster)
+            # CRITICAL FIX: Added fill_value=0.0 to prevent NaN outside convex hull
             Vk_full = griddata(
                 points_sparse, 
                 Vk_values, 
                 (fx_full, fy_full), 
-                method=opt.interpolation_method
+                method=opt.interpolation_method,
+                fill_value=0.0  # Fill outside support with 0 (no high-frequency content)
             )
-            
-            # Transform to spatial domain
-            spat_full = ifft2c_rect(Vk_full) * np.sqrt(Ny*Nx)
-            
-            # Center crop
-            spat_crop = crop_kernel_center_rect(spat_full, opt.kernel_crop_h, opt.kernel_crop_w)
-            
-            kernels.append(spat_crop)
-            
-            if (k+1) % 10 == 0:
-                print(f"  Reconstructed {k+1}/{n_socs} kernels")
+        
+        # CRITICAL FIX: Explicit NaN check and handling
+        if np.any(np.isnan(Vk_full)):
+            print(f"[WARNING] NaN detected in interpolated Vk_full for kernel {k+1}. Filling with 0.")
+            Vk_full = np.nan_to_num(Vk_full, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Transform to spatial domain
+        spat_full = ifft2c_rect(Vk_full) * np.sqrt(Ny*Nx)
+        
+        # Center crop
+        spat_crop = crop_kernel_center_rect(spat_full, opt.kernel_crop_h, opt.kernel_crop_w)
+        
+        kernels.append(spat_crop)
+        
+        if (k+1) % 10 == 0:
+            print(f"  Reconstructed {k+1}/{n_socs} kernels")
     
     print(f"[RECON] Reconstruction Time: {time.time()-start:.2f}s")
     return kernels
@@ -558,7 +569,7 @@ def visualize_compressed_results(
         height = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2., height,
                 f'{height:.2f}GB\n({memory_full/memory_sparse:.0f}x)', 
-                ha='center', va='bottom' if i==0 else 'top')
+                ha='center', va='bottom')
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -601,7 +612,8 @@ if __name__ == "__main__":
         kernel_crop_h=64,
         kernel_crop_w=64,
         sparse_sampling_rate=0.30,  # 30% sampling rate (tuneable: 0.20-0.50)
-        interpolation_method='rbf'  # 'rbf', 'linear', 'nearest'
+        interpolation_method='rbf',  # 'rbf', 'linear', 'nearest'
+        random_seed=42
     )
     
     # Configure test pattern
@@ -613,3 +625,4 @@ if __name__ == "__main__":
     
     # Clean up large arrays
     gc.collect()
+    print("[CLEANUP] Large arrays cleared from memory.")
