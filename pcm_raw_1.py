@@ -60,7 +60,7 @@ class LithoOpticsRect:
     N_y: int = 1024                   # Y-axis grid points (asymmetric)
     sigma_c: float = 0.5              # Conventional source coherence factor
     
-    # Mask Pattern Parameters (Added based on bug report)
+    # Mask Pattern Parameters
     line_width_nm: float = 3000.0     # Line width for test pattern
     pitch_nm: float = 12000.0         # Pitch period for test pattern
     
@@ -73,7 +73,7 @@ class LithoOpticsRect:
     # Sparse Sampling Parameter
     sparse_sampling_rate: float = 0.30  # Sampling ratio within optical support (0-1)
     
-    # Interpolation Method (Optimization parameter)
+    # Interpolation Method
     interpolation_method: str = 'rbf'   # 'rbf', 'linear', 'nearest'
     
     def __post_init__(self):
@@ -132,9 +132,7 @@ def adaptive_sparse_freq_sampling(opt: LithoOpticsRect, fx: np.ndarray, fy: np.n
     dx_eff = int(opt.N_x * f_bound / (1/(2*opt.dx_nm)))
     
     # Sparse strategy: dense in center, sparse at edges
-    # Sample 25% central region with full sampling rate
     y_idx_center = np.linspace(0, dy_eff//4, int(dy_eff//4 * opt.sparse_sampling_rate), dtype=int)
-    # Sample edge region with 50% reduced rate
     y_idx_edge = np.linspace(dy_eff//4, dy_eff//2, int(dy_eff//8 * opt.sparse_sampling_rate * 0.5), dtype=int)
     y_idx = np.unique(np.concatenate([y_idx_center, y_idx_edge]))
     
@@ -142,7 +140,7 @@ def adaptive_sparse_freq_sampling(opt: LithoOpticsRect, fx: np.ndarray, fy: np.n
     x_idx_edge = np.linspace(dx_eff//4, dx_eff//2, int(dx_eff//8 * opt.sparse_sampling_rate * 0.5), dtype=int)
     x_idx = np.unique(np.concatenate([x_idx_center, x_idx_edge]))
     
-    # Use Hermitian symmetry: sample 1/4 region and mirror later
+    # Use Hermitian symmetry: sample 1/4 region
     fy_base = np.fft.fftfreq(opt.N_y, d=opt.dy_nm)
     fx_base = np.fft.fftfreq(opt.N_x, d=opt.dx_nm)
     
@@ -153,7 +151,7 @@ def adaptive_sparse_freq_sampling(opt: LithoOpticsRect, fx: np.ndarray, fy: np.n
     fx_sparse, fy_sparse = np.meshgrid(fx_sparse, fy_sparse)
     
     # Calculate sampling weights to compensate for undersampling
-    dy_ratio = len(y_idx) / (opt.N_y/2)  # Half due to symmetry
+    dy_ratio = len(y_idx) / (opt.N_y/2)
     dx_ratio = len(x_idx) / (opt.N_x/2)
     sampling_weights = np.ones_like(fx_sparse) / (dy_ratio * dx_ratio)
     
@@ -203,7 +201,7 @@ def sample_conventional_source(opt: LithoOpticsRect) -> Tuple[np.ndarray, np.nda
     return np.stack([fx_s, fy_s], axis=1), weights
 
 # ==============================================================================
-# Module 6: Sparse Mode Matrix Construction (Memory Optimization)
+# Module 6: Sparse Mode Matrix Construction (CRITICAL BUG FIX)
 # ==============================================================================
 def build_sparse_mode_matrix_M(
     opt: LithoOpticsRect,
@@ -213,34 +211,53 @@ def build_sparse_mode_matrix_M(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Construct sparse M matrix: M_sparse ∈ C^(N_sparse × N_source)
+    
+    BUG FIX: Flatten 2D meshgrids to 1D arrays to match sampling_weights dimension.
+    Original code failed due to shape mismatch between 2D frequency arrays and 1D weights.
     """
-    N_sparse = len(fx_sparse)
+    # CRITICAL FIX: Flatten 2D meshgrids to 1D for consistent matrix operations
+    fx_sparse_flat = fx_sparse.ravel()
+    fy_sparse_flat = fy_sparse.ravel()
+    
+    N_sparse = len(fx_sparse_flat)  # Total number of sparse frequency points
     Ns = opt.N_source
     
     # Sample source points
     fs_coords, weights = sample_conventional_source(opt)
     
+    # Pre-allocate matrix
     M_sparse = np.zeros((N_sparse, Ns), dtype=np.complex128)
+    
+    # Pre-calculate sqrt of sampling_weights for efficiency
+    sqrt_sampling_weights = np.sqrt(sampling_weights + EPS)
     
     print(f"[BUILD] Constructing M matrix...")
     start = time.time()
     
     for i in range(Ns):
         fx_s, fy_s = fs_coords[i]
-        w = np.sqrt(weights[i] * sampling_weights + EPS)
+        # Combine source weight with sampling weights (element-wise)
+        w = sqrt_sampling_weights * np.sqrt(weights[i] + EPS)
         
-        # Calculate shifted pupils on sparse grid
-        P1 = shifted_pupil_rect(fx_sparse, fy_sparse, np.array([-fx_s/2, -fy_s/2]), opt)
-        P2 = shifted_pupil_rect(fx_sparse, fy_sparse, np.array([+fx_s/2, +fy_s/2]), opt)
+        # Calculate shifted pupils on flattened sparse grid
+        P1 = shifted_pupil_rect(fx_sparse_flat, fy_sparse_flat, np.array([-fx_s/2, -fy_s/2]), opt)
+        P2 = shifted_pupil_rect(fx_sparse_flat, fy_sparse_flat, np.array([+fx_s/2, +fy_s/2]), opt)
         
-        # Sparse mode vector
-        mode_sparse = (P1 * P2.conj()) * w
+        # Calculate sparse mode vector (all 1D arrays, element-wise multiplication)
+        mode_sparse = P1 * P2.conj() * w
+        
+        # Assign to column
         M_sparse[:, i] = mode_sparse
         
         if (i+1) % 50 == 0:
             print(f"  Progress: {i+1}/{Ns} modes completed")
     
-    print(f"[BUILD] M matrix size: {M_sparse.shape} = {M_sparse.nbytes/1e6:.1f} MB | Time: {time.time()-start:.2f}s")
+    elapsed = time.time() - start
+    print(f"[BUILD] M matrix shape: {M_sparse.shape}, Memory: {M_sparse.nbytes/1e6:.1f} MB | Time: {elapsed:.2f}s")
+    
+    # Clear temporary arrays to free memory
+    del fx_sparse_flat, fy_sparse_flat
+    
     return M_sparse, fs_coords, weights
 
 # ==============================================================================
@@ -253,7 +270,8 @@ def sparse_socs_decompose(M_sparse: np.ndarray, n_socs: int, energy_threshold: f
     print(f"\n[SVD] Sparse domain decomposition...")
     start = time.time()
     
-    U, sigma, _ = svd(M_sparse, full_matrices=False, overwrite_a=True)
+    # Use LAPACK's gesvd for better numerical stability
+    U, sigma, _ = svd(M_sparse, full_matrices=False, overwrite_a=True, check_finite=False)
     alpha = sigma[:n_socs]**2
     
     # Energy validation
@@ -263,7 +281,8 @@ def sparse_socs_decompose(M_sparse: np.ndarray, n_socs: int, energy_threshold: f
     
     print(f"      Energy Retained: {energy_ratio:.6f} (Target ≥ {energy_threshold})")
     if energy_ratio < energy_threshold:
-        print(f"      WARNING: Consider increasing n_socs to {int(n_socs/energy_ratio)}")
+        recommended_n_socs = int(np.ceil(n_socs / energy_ratio))
+        print(f"      WARNING: Consider increasing n_socs to {recommended_n_socs}")
     
     V_sparse = U[:, :n_socs]  # Sparse basis
     print(f"      SVD Time: {time.time()-start:.2f}s")
@@ -294,41 +313,60 @@ def reconstruct_kernels_from_sparse(
     
     kernels = []
     print(f"\n[RECON] Interpolating {n_socs} kernels...")
+    print(f"         Method: {opt.interpolation_method}")
     start = time.time()
     
-    for k in range(n_socs):
-        Vk_values = V_sparse[:, k]
+    # Choose interpolation method
+    if opt.interpolation_method == 'rbf':
+        # Prepare RBF interpolator (more accurate but slower)
+        epsilon = 0.1
         
-        # Interpolate to full grid
-        if opt.interpolation_method == 'rbf':
-            # Radial Basis Function (accurate but slower)
+        for k in range(n_socs):
+            Vk_values = V_sparse[:, k]
+            
+            # Create RBF interpolator
             rbf_interp = Rbf(
                 fx_sparse.ravel(), 
                 fy_sparse.ravel(), 
                 Vk_values,
                 function='multiquadric',
-                epsilon=0.1
+                epsilon=epsilon
             )
             Vk_full = rbf_interp(fx_full, fy_full)
-        else:
-            # Linear/Nearest interpolation (faster)
+            
+            # Transform to spatial domain
+            spat_full = ifft2c_rect(Vk_full) * np.sqrt(Ny*Nx)
+            
+            # Center crop
+            spat_crop = crop_kernel_center_rect(spat_full, opt.kernel_crop_h, opt.kernel_crop_w)
+            
+            kernels.append(spat_crop)
+            
+            if (k+1) % 10 == 0:
+                print(f"  Reconstructed {k+1}/{n_socs} kernels")
+    else:
+        # Use griddata interpolation (faster)
+        for k in range(n_socs):
+            Vk_values = V_sparse[:, k]
+            
+            # Interpolate to full grid
             Vk_full = griddata(
                 points_sparse, 
                 Vk_values, 
                 (fx_full, fy_full), 
                 method=opt.interpolation_method
             )
-        
-        # Transform to spatial domain
-        spat_full = ifft2c_rect(Vk_full) * np.sqrt(Ny*Nx)
-        
-        # Center crop
-        spat_crop = crop_kernel_center_rect(spat_full, opt.kernel_crop_h, opt.kernel_crop_w)
-        
-        kernels.append(spat_crop)
-        
-        if (k+1) % 10 == 0:
-            print(f"  Reconstructed {k+1}/{n_socs} kernels")
+            
+            # Transform to spatial domain
+            spat_full = ifft2c_rect(Vk_full) * np.sqrt(Ny*Nx)
+            
+            # Center crop
+            spat_crop = crop_kernel_center_rect(spat_full, opt.kernel_crop_h, opt.kernel_crop_w)
+            
+            kernels.append(spat_crop)
+            
+            if (k+1) % 10 == 0:
+                print(f"  Reconstructed {k+1}/{n_socs} kernels")
     
     print(f"[RECON] Reconstruction Time: {time.time()-start:.2f}s")
     return kernels
@@ -352,6 +390,7 @@ def fft_convolve_rect(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     Ny, Nx = img.shape
     kernel_padded = pad_kernel_to_size_rect(kernel, Ny, Nx)
     
+    # Apply FFT and multiply in frequency domain
     img_freq = fft2c_rect(img)
     ker_freq = fft2c_rect(kernel_padded)
     result = ifft2c_rect(img_freq * ker_freq)
@@ -370,6 +409,7 @@ def aerial_image_socs_rect(
     print(f"\n[IMAGING] SOCS synthesis ({opt.n_socs} orders)...")
     start = time.time()
     
+    # Accumulate intensity contributions from each kernel
     for k, ker in enumerate(kernels):
         conv = fft_convolve_rect(mask, ker)
         I += alpha[k] * np.abs(conv)**2
@@ -377,7 +417,7 @@ def aerial_image_socs_rect(
         if (k+1) % 10 == 0:
             print(f"  Order {k+1}/{len(kernels)} completed")
     
-    # Normalize
+    # Normalize intensity
     I_norm = I / (np.max(I) + EPS)
     print(f"[IMAGING] Imaging Time: {time.time()-start:.2f}s")
     
@@ -571,5 +611,5 @@ if __name__ == "__main__":
     # Run simulation
     results = run_ultra_compressed_simulation(opt_355nm)
     
-    # Optional: Clear large arrays from memory
+    # Clean up large arrays
     gc.collect()
